@@ -2,6 +2,3 @@ customtkinter
 pyautogui
 pyperclip
 pygetwindow
-pillow
-numpy
-easyocr
