@@ -1,28 +1,14 @@
 import threading
 import time
 import re
-import os
 import customtkinter as ctk
 import pyautogui
 import pyperclip
 import pygetwindow as gw
-from PIL import ImageGrab
-import numpy as np
 
-# Пытаемся импортировать EasyOCR для точного чтения экрана
-try:
-    import easyocr
-    # Инициализируем распознаватель для русского и английского языков
-    reader = easyocr.Reader(['ru', 'en'], gpu=False)
-    OCR_AVAILABLE = True
-except Exception:
-    OCR_AVAILABLE = False
-
-# --- НАСТРОЙКИ UI ---
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-# --- ТАБЛИЦА МАСШТАБИРОВАНИЯ ДОКОВ (СКРИН 9) ---
 DOCK_MAPPING = {
     "аша дальняя": "D-A-DL-4-2",
     "миасс": "D-MIASS-1-1",
@@ -47,177 +33,103 @@ DOCK_MAPPING = {
 
 UNIVERSAL_CELL = "D-KM-1"
 
-class WMSPerfectBot(ctk.CTk):
+class WMSLinearBot(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("WMS Ultimate Bot v5.0 🤖")
-        self.geometry("600x650")
+        self.title("WMS Loop Automator v6.0")
+        self.geometry("600x600")
         self.resizable(False, False)
 
         self.is_running = False
         self.target_window_title = None
         self.cycles_count = 0
-        self.error_fallback = False  # Переключение на D-KM-1 при ошибке
-        self.adaptation_mode = True
-        self.start_time = 0
+        self.fallback_active = False
 
         self.setup_ui()
         self.refresh_windows_list()
 
     def setup_ui(self):
-        self.header = ctk.CTkLabel(self, text="⚡ WMS Из Полноценного Цикла v5.0", font=("Arial", 20, "bold"), text_color="#00BFFF")
-        self.header.pack(pady=(15, 5))
+        self.header = ctk.CTkLabel(self, text="⚡ WMS Robot v6.0", font=("Arial", 20, "bold"), text_color="#00BFFF")
+        self.header.pack(pady=15)
 
-        self.metrics_frame = ctk.CTkFrame(self, fg_color="#2b2b2b", corner_radius=12)
+        self.metrics_frame = ctk.CTkFrame(self, fg_color="#2b2b2b")
         self.metrics_frame.pack(pady=10, padx=20, fill="x")
 
-        self.lbl_cycles = ctk.CTkLabel(self.metrics_frame, text="🔁 Выполнено кругов: 0", font=("Arial", 14, "bold"))
-        self.lbl_cycles.grid(row=0, column=0, padx=20, pady=8, sticky="w")
+        self.lbl_cycles = ctk.CTkLabel(self.metrics_frame, text="🔁 Циклы: 0", font=("Arial", 14, "bold"))
+        self.lbl_cycles.grid(row=0, column=0, padx=20, pady=8)
 
-        self.lbl_status = ctk.CTkLabel(self.metrics_frame, text="Статус: ⏸ Пауза", font=("Arial", 14, "bold"), text_color="gray")
-        self.lbl_status.grid(row=0, column=1, padx=20, pady=8, sticky="e")
+        self.lbl_status = ctk.CTkLabel(self.metrics_frame, text="Статус: Ожидание", font=("Arial", 14, "bold"), text_color="gray")
+        self.lbl_status.grid(row=0, column=1, padx=20, pady=8)
 
-        self.win_frame = ctk.CTkFrame(self, fg_color="#232323", corner_radius=12)
+        self.win_frame = ctk.CTkFrame(self, fg_color="#232323")
         self.win_frame.pack(pady=10, padx=20, fill="x")
 
-        self.lbl_choose = ctk.CTkLabel(self.win_frame, text="Выберите окно терминала WMS:", font=("Arial", 12, "bold"))
-        self.lbl_choose.pack(pady=(8, 2), padx=15, anchor="w")
-
         self.combo_windows = ctk.CTkComboBox(self.win_frame, width=400)
-        self.combo_windows.pack(side="left", padx=(15, 10), pady=(0, 15))
+        self.combo_windows.pack(side="left", padx=15, pady=15)
 
-        self.btn_refresh = ctk.CTkButton(self.win_frame, text="🔄 Обновить", width=100, fg_color="#6c757d", hover_color="#5a6268", command=self.refresh_windows_list)
-        self.btn_refresh.pack(side="left", padx=(0, 15), pady=(0, 15))
+        self.btn_refresh = ctk.CTkButton(self.win_frame, text="🔄", width=50, command=self.refresh_windows_list)
+        self.btn_refresh.pack(side="left", padx=5, pady=15)
 
         self.btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.btn_frame.pack(pady=10)
+        self.btn_frame.pack(pady=15)
 
-        self.btn_start = ctk.CTkButton(self.btn_frame, text="▶ ЗАПУСТИТЬ БОТА", fg_color="#28a745", hover_color="#218838", 
-                                       font=("Arial", 14, "bold"), width=220, height=40, command=self.start_bot)
+        self.btn_start = ctk.CTkButton(self.btn_frame, text="▶ ПУСК", fg_color="#28a745", width=200, height=40, command=self.start_bot)
         self.btn_start.grid(row=0, column=0, padx=10)
 
-        self.btn_stop = ctk.CTkButton(self.btn_frame, text="⏹ ОСТАНОВИТЬ", fg_color="#dc3545", hover_color="#c82333", 
-                                      font=("Arial", 14, "bold"), width=220, height=40, state="disabled", command=self.stop_bot)
+        self.btn_stop = ctk.CTkButton(self.btn_frame, text="⏹ СТОП", fg_color="#dc3545", width=200, height=40, state="disabled", command=self.stop_bot)
         self.btn_stop.grid(row=0, column=1, padx=10)
 
-        self.log_box = ctk.CTkTextbox(self, width=550, height=260, corner_radius=10, font=("Consolas", 11))
-        self.log_box.pack(pady=15)
-        
-        if OCR_AVAILABLE:
-            self.log("Система EasyOCR успешно подключена. Готова распознавать текст.")
-        else:
-            self.log("⚠️ Внимание: Модуль EasyOCR загружается. Сборка адаптирована.")
+        self.log_box = ctk.CTkTextbox(self, width=540, height=240)
+        self.log_box.pack(pady=10)
 
     def log(self, text):
         self.log_box.insert("end", f"> {text}\n")
         self.log_box.see("end")
 
     def refresh_windows_list(self):
-        try:
-            titles = [w.title for w in gw.getAllWindows() if w.title.strip()]
-            titles = sorted(list(set(titles)))
-            if titles:
-                self.combo_windows.configure(values=titles)
-                self.combo_windows.set(titles[0])
-            else:
-                self.combo_windows.configure(values=["Окна не найдены"])
-        except Exception as e:
-            self.log(f"Ошибка поиска окон: {e}")
+        titles = [w.title for w in gw.getAllWindows() if w.title.strip()]
+        titles = sorted(list(set(titles)))
+        if titles:
+            self.combo_windows.configure(values=titles)
+            self.combo_windows.set(titles[0])
 
     def start_bot(self):
         selected = self.combo_windows.get()
-        if not selected or selected in ["Окна не найдены"]:
-            self.log("❌ Сначала выберите окно терминала!")
-            return
-
+        if not selected: return
         self.target_window_title = selected
         self.is_running = True
-        self.start_time = time.time()
         self.btn_start.configure(state="disabled")
-        self.btn_refresh.configure(state="disabled")
-        self.combo_windows.configure(state="disabled")
         self.btn_stop.configure(state="normal")
-        self.lbl_status.configure(text="Статус: ▶ РАБОТАЕТ", text_color="#28a745")
-        self.log(f"🚀 Старт сканирования всех 12 шагов для окна: '{self.target_window_title}'")
+        self.lbl_status.configure(text="Статус: АКТИВЕН", text_color="#28a745")
         threading.Thread(target=self.bot_engine, daemon=True).start()
 
     def stop_bot(self):
         self.is_running = False
         self.btn_start.configure(state="normal")
-        self.btn_refresh.configure(state="normal")
-        self.combo_windows.configure(state="normal")
         self.btn_stop.configure(state="disabled")
-        self.lbl_status.configure(text="Статус: ⏸ ПАУЗА", text_color="#dc3545")
+        self.lbl_status.configure(text="Статус: СТОП", text_color="#dc3545")
 
-    def get_screen_text_by_ocr(self, win):
-        """Делает скриншот окна и распознает текст оптически с разделением по строкам"""
+    def get_clean_text(self):
         try:
-            left, top, right, bottom = win.left, win.top, win.right, win.bottom
-            if right - left <= 0 or bottom - top <= 0:
-                return []
-            
-            # Захват картинки окна
-            screenshot = ImageGrab.grab(bbox=(left, top, right, bottom))
-            img_np = np.array(screenshot)
-            
-            if OCR_AVAILABLE:
-                # Читаем картинку через EasyOCR
-                results = reader.readtext(img_np, detail=0)
-                return [line.lower().strip() for line in results if line.strip()]
-            else:
-                # Резервный буферный метод, если библиотека еще не инициализирована
-                pyperclip.copy("")
-                pyautogui.hotkey('ctrl', 'a')
-                time.sleep(0.04)
-                pyautogui.hotkey('ctrl', 'c')
-                return [line.lower().strip() for line in pyperclip.paste().split('\n') if line.strip()]
-        except Exception:
-            return []
-
-    def focus_and_input(self, win, text_data):
-        """Адаптивный ввод в активное поле 'Контроль'"""
-        try:
-            if time.time() - self.start_time < 10:
-                # Первые 10 секунд кликаем в нижнюю треть (настройка под мышку)
-                cx = win.left + (win.width // 2)
-                cy = win.top + int(win.height * 0.73)
-                pyautogui.click(cx, cy)
-                time.sleep(0.05)
-            else:
-                # Затем используем мгновенный слепой фокус
-                pyautogui.press('tab')
-
+            pyperclip.copy("")
             pyautogui.hotkey('ctrl', 'a')
-            pyautogui.press('backspace')
-            time.sleep(0.02)
-            
-            # Пишем через буфер (чтобы не путать раскладку)
-            pyperclip.copy(text_data)
-            time.sleep(0.02)
-            pyautogui.hotkey('ctrl', 'v')
-            time.sleep(0.04)
-            pyautogui.press('enter')
-        except Exception as e:
-            self.log(f"Ошибка ввода: {e}")
+            time.sleep(0.05)
+            pyautogui.hotkey('ctrl', 'c')
+            time.sleep(0.05)
+            return pyperclip.paste().lower().strip()
+        except:
+            return ""
 
-    def extract_code_after_keyword(self, lines, keyword):
-        """Ищет строку со словом (место, паллета, коробка) и вытягивает код после него"""
-        for line in lines:
-            if keyword in line:
-                # Ищем штрихкоды, номера ячеек (цифры, буквы, дефисы)
-                match = re.search(r'(?:' + keyword + r'[:\s]+)([a-zA-Z0-9\-_\s]+)', line)
-                if match:
-                    res = match.group(1).strip().upper()
-                    # Убираем лишние пробелы
-                    return res.replace(" ", "")
-                
-                # Дополнительная проверка на поиск кода в следующей строке
-                idx = lines.index(line)
-                if idx + 1 < len(lines):
-                    next_line = lines[idx + 1].strip().upper()
-                    if len(next_line) > 2:
-                        return next_line.replace(" ", "")
-        return None
+    def send_value(self, value):
+        pyautogui.press('tab')
+        time.sleep(0.02)
+        pyautogui.hotkey('ctrl', 'a')
+        pyautogui.press('backspace')
+        pyperclip.copy(value)
+        time.sleep(0.02)
+        pyautogui.hotkey('ctrl', 'v')
+        time.sleep(0.05)
+        pyautogui.press('enter')
 
     def bot_engine(self):
         while self.is_running:
@@ -227,112 +139,84 @@ class WMSPerfectBot(ctk.CTk):
                 continue
             
             win = wins[0]
-            if win.isMinimized:
-                win.restore()
+            if win.isMinimized: win.restore()
             win.activate()
-            
-            # Читаем строки с экрана через OCR
-            lines = self.get_screen_text_by_ocr(win)
-            full_text = " ".join(lines)
+            time.sleep(0.1)
 
-            if not lines:
-                time.sleep(0.5)
-                continue
+            text = self.get_clean_text()
 
-            # --- ПРОВЕРКА СКРИНА ОШИБКИ И СБОЕВ ---
-            if any(err in full_text for err in ["не найден", "не существует", "не зарегистрирован", "ошибка"]):
-                self.log("⚠️ Обнаружен экран ошибки! Нажимаю OK (Enter) и включаю аварийный D-KM-1...")
+            if not text:
                 pyautogui.press('enter')
-                self.error_fallback = True
                 time.sleep(0.5)
                 continue
 
-            # --- КАРТА ВСЕХ 12 ШАГОВ (ВХОД С ЛЮБОГО МЕСТА) ---
+            if any(x in text for x in ["не найден", "не существует", "ошибка", "зарегистрирован"]):
+                self.log("Обнаружен попап ошибки. Сброс.")
+                pyautogui.press('enter')
+                self.fallback_active = True
+                time.sleep(0.5)
+                continue
 
-            # [Скрин 1-2] Главное меню или Окно "Взять работу"
-            if "запросить работу" in full_text or "взять работу" in full_text or "главное меню" in full_text:
-                self.log("[Шаг 1-2] Вижу меню запроса работы. Нажимаю Запросить/Взять работу (F2/Клик)...")
-                cx = win.left + (win.width // 2)
-                cy = win.top + (win.height // 2)
-                pyautogui.click(cx, cy)
+            # Проверка условий по шагам (1-12)
+            if any(x in text for x in ["главное меню", "запросить работу", "взять работу"]):
+                self.log("Шаг 1-2: Запрос работы")
                 pyautogui.press('f2')
-                time.sleep(0.6)
+                time.sleep(0.5)
 
-            # [Скрин 3-4] Переместитесь к МЕСТУ
-            elif "место" in full_text and "контроль" in full_text:
-                self.log("[Шаг 3-4] Экран: [МЕСТО]. Извлекаю код ячейки...")
-                code = self.extract_code_after_keyword(lines, "место")
-                if code:
-                    self.log(f"Успешно считано Место: {code} -> Вставляю в Контроль")
-                    self.focus_and_input(win, code)
+            elif "место" in text and "контроль" in text:
+                self.log("Шаг 3-4: Обработка места")
+                match = re.search(r'место[:\s]+([a-z0-9\-]+)', text)
+                if match:
+                    self.send_value(match.group(1).upper())
                 else:
                     pyautogui.press('enter')
 
-            # [Скрин 5-6] Возьмите ПАЛЛЕТУ
-            elif "палет" in full_text or "контейнер" in full_text:
-                self.log("[Шаг 5-6] Экран: [ПАЛЛЕТА]. Извлекаю код паллеты...")
-                code = self.extract_code_after_keyword(lines, "палет")
-                if not code:
-                    code = self.extract_code_after_keyword(lines, "место") # Ищем код контейнера
-                
-                if code:
-                    self.log(f"Успешно считана Паллета: {code} -> Вставляю в Контроль")
-                    self.focus_and_input(win, code)
+            elif "палет" in text or "контейнер" in text:
+                self.log("Шаг 5-6: Обработка паллеты")
+                match = re.search(r'палет[:\s]+([a-z0-9\-]+)', text)
+                if match:
+                    self.send_value(match.group(1).upper())
                 else:
                     pyautogui.press('enter')
 
-            # [Скрин 7-8] Возьмите КОРОБКУ
-            elif "коробк" in full_text and not "размещение" in full_text:
-                self.log("[Шаг 7-8] Экран: [КОРОБКА]. Извлекаю штрихкод коробки...")
-                code = self.extract_code_after_keyword(lines, "коробк")
-                if code:
-                    self.log(f"Успешно считана Коробка: {code} -> Вставляю в Контроль")
-                    self.focus_and_input(win, code)
+            elif "коробк" in text and "размещение" not in text:
+                self.log("Шаг 7-8: Обработка коробки")
+                match = re.search(r'коробк[:\s]+([a-z0-9\-]+)', text)
+                if match:
+                    self.send_value(match.group(1).upper())
                 else:
                     pyautogui.press('enter')
 
-            # [Скрин 9] Укажите коды места зоны / ДОК НАЗНАЧЕНИЯ
-            elif "док" in full_text or "зона" in full_text or "назначение" in full_text:
-                self.log("[Шаг 9] Экран: [ДОК НАЗНАЧЕНИЯ]")
-                
-                # Если до этого вылетала ошибка или включен принудительный сброс
-                if self.error_fallback:
-                    self.log(f"Сработала защита от ошибок. Применяю супер-ячейку: {UNIVERSAL_CELL}")
-                    self.focus_and_input(win, UNIVERSAL_CELL)
-                    self.error_fallback = False
+            elif any(x in text for x in ["док", "зона", "назначение"]):
+                self.log("Шаг 9: Определение дока")
+                if self.fallback_active:
+                    self.send_value(UNIVERSAL_CELL)
+                    self.fallback_active = False
                 else:
-                    # Ищем город дока на экране
-                    target_code = UNIVERSAL_CELL
-                    for city_name, code_val in DOCK_MAPPING.items():
-                        if city_name in full_text:
-                            self.log(f"EasyOCR определил Док: {city_name.upper()}")
-                            target_code = code_val
+                    target = UNIVERSAL_CELL
+                    for k, v in DOCK_MAPPING.items():
+                        if k in text:
+                            target = v
                             break
-                    
-                    self.log(f"Вставляю код дока: {target_code}")
-                    self.focus_and_input(win, target_code)
+                    self.send_value(target)
 
-            # [Скрин 10-11] Размещение в место (Подтверждение)
-            elif "размещение в место" in full_text:
-                self.log("[Шаг 10-11] Подтверждаю размещение коробки на место по Enter.")
+            elif "размещение в место" in text:
+                self.log("Шаг 10-11: Подтверждение размещения")
                 pyautogui.press('enter')
                 self.cycles_count += 1
-                self.lbl_cycles.configure(text=f"Выполнено кругов: {self.cycles_count}")
-                self.error_fallback = False
+                self.lbl_cycles.configure(text=f"Циклы: {self.cycles_count}")
                 time.sleep(0.5)
 
-            # [Скрин 12] Финал (Коробок не осталось, последняя коробка)
-            elif "последн" in full_text or "осталось" in full_text or "заверш" in full_text:
-                self.log("[Шаг 12] Последняя коробка в цикле! Жестко ставим аварийный D-KM-1")
-                self.focus_and_input(win, UNIVERSAL_CELL)
+            elif any(x in text for x in ["последн", "осталось", "заверш"]):
+                self.log("Шаг 12: Финал партии")
+                self.send_value(UNIVERSAL_CELL)
                 time.sleep(0.5)
 
             else:
-                # Если экран неочевидный, даем легкий Enter, чтобы продвинуть процесс
                 pyautogui.press('enter')
 
-            time.sleep(0.8) # Интервал «взгляда» робота на экран
+            time.sleep(0.7)
 
 if __name__ == "__main__":
-    app = WMSPerfectBot()
+    app = WMSLinearBot()
     app.mainloop()
