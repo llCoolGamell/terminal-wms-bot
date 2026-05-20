@@ -8,6 +8,10 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    
+    # Вот эти две строчки железно дадут права на создание Релиза:
+    permissions:
+      contents: write
 
     steps:
     - name: Checkout code
