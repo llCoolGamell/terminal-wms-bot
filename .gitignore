@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+dist/
+build/
+*.spec
+wms_docks.json
+wms_cycles.csv
+last_screen.png
+last_ocr.txt

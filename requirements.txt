@@ -2,3 +2,7 @@ customtkinter
 pyautogui
 pyperclip
 pygetwindow
+Pillow
+pytesseract
+keyboard
+pywin32
