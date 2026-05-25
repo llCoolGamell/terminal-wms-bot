@@ -64,7 +64,7 @@ except ImportError:
     win32gui = None  # type: ignore
 
 
-APP_VERSION = "7.2"
+APP_VERSION = "7.3"
 APP_DIR = Path(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))))
 # Все рантайм-файлы рядом с exe / скриптом (а не во временной папке PyInstaller)
 RUNTIME_DIR = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) if getattr(sys, "frozen", False) else Path.cwd()
@@ -404,7 +404,13 @@ class WMSBot(ctk.CTk):
         # ---- состояние ----
         self.is_running = False
         self.is_paused = False
-        self.cycles_count = 0
+        # Работа = одно выполнение от 'Взятие работы' до возврата
+        # в 'Главное меню'/'Взятие работы'. Коробок в работе может быть много.
+        self.cycles_count = 0          # выполненных работ
+        self.boxes_in_work = 0         # коробок в текущей работе
+        self.boxes_total = 0           # всего коробок за сессию
+        self._in_work = False          # True между 'Взятие' и возвратом в меню
+        self._work_start_ts: Optional[float] = None
         self.errors_count = 0
         self.fallbacks_count = 0
         self.cycle_times: deque = deque(maxlen=30)
@@ -441,7 +447,7 @@ class WMSBot(ctk.CTk):
         # метрики + сброс счётчика + live-stats
         metrics = ctk.CTkFrame(self, fg_color="#2b2b2b")
         metrics.pack(fill="x", padx=10, pady=(8, 4))
-        self.lbl_cycles = ctk.CTkLabel(metrics, text="🔁 Циклов: 0",
+        self.lbl_cycles = ctk.CTkLabel(metrics, text="🔁 Работ: 0  📦 Коробок: 0",
                                        font=("Arial", 14, "bold"))
         self.lbl_cycles.pack(side="left", padx=12, pady=8)
         ctk.CTkButton(metrics, text="↺ Сброс", width=70,
@@ -581,7 +587,10 @@ class WMSBot(ctk.CTk):
         self.after(0, lambda: self.lbl_stats.configure(text=text))
 
     def _update_cycles_label(self) -> None:
-        self.after(0, lambda: self.lbl_cycles.configure(text=f"🔁 Циклов: {self.cycles_count}"))
+        self.after(0, lambda: self.lbl_cycles.configure(
+            text=f"🔁 Работ: {self.cycles_count}  "
+                 f"📦 Коробок: {self.boxes_total}"
+                 + (f" (текущая: {self.boxes_in_work})" if self._in_work else "")))
 
     # ---------- UI events ----------
 
@@ -670,6 +679,10 @@ class WMSBot(ctk.CTk):
 
     def _reset_counter(self) -> None:
         self.cycles_count = 0
+        self.boxes_in_work = 0
+        self.boxes_total = 0
+        self._in_work = False
+        self._work_start_ts = None
         self.errors_count = 0
         self.fallbacks_count = 0
         self.cycle_times.clear()
@@ -1213,21 +1226,28 @@ class WMSBot(ctk.CTk):
         self._log_thread("Поток бота завершён.")
 
     def _dispatch_screen(self, win, title: str) -> None:
-        if "Главное меню" in title:
-            self._log_thread("📺 Главное меню → F2 (Запросить работу)")
-            if self._cycle_start_ts is None:
-                self._cycle_start_ts = time.time()
+        hwnd = self._hwnd_of(win)
+
+        # Возврат в главное меню или взятие работы.
+        # Если до этого мы были "в работе" — значит работа завершилась.
+        if "Главное меню" in title or "Взятие работы" in title:
+            if self._in_work:
+                self._on_work_complete()
+            # На этом экране пробуем F2, чтобы запросить следующую работу
+            if "Главное меню" in title:
+                self._log_thread("📺 Главное меню → F2 (Запросить работу)")
+            else:
+                self._log_thread("📺 Взятие работы → F2")
             self._press("f2")
             return
 
-        if "Взятие работы" in title:
-            self._log_thread("📺 Взятие работы → F2")
-            self._press("f2")
-            return
+        # Если мы НА любом другом WMS-экране — мы внутри работы.
+        if not self._in_work:
+            self._start_work()
 
         if "Выбор работ" in title:
-            self._log_thread("📺 Выбор работ → Enter (Ок)")
-            self._press("enter")
+            self._log_thread("📺 Выбор работ → Ок")
+            self._click_dialog_ok(hwnd)
             return
 
         if "Перемещение к источнику" in title:
@@ -1280,22 +1300,67 @@ class WMSBot(ctk.CTk):
             return
 
         if "Размещение в место" in title:
-            self._log_thread("📺 Размещение → Enter ✔ цикл завершён")
-            self._press("enter")
-            self._on_cycle_complete()
+            # Это финал коробки — жмём Ок, инкрементим счётчик коробок,
+            # переходим к следующей коробке.
+            self.boxes_in_work += 1
+            self.boxes_total += 1
+            self._log_thread(
+                f"📺 Размещение → Ок ✔ коробка #{self.boxes_in_work} размещена")
+            self._click_dialog_ok(hwnd)
+            self._update_cycles_label()
+            self._update_stats()
             return
 
         # неопознанный экран — НЕ нажимаем Enter (могли попасть в попап с OK),
         # лучше дать _dismiss_popup отработать на следующей итерации
         self._log_thread(f"❓ Неопознанный экран '{title}' — пропуск.")
 
-    def _on_cycle_complete(self) -> None:
+    def _click_dialog_ok(self, hwnd: int) -> None:
+        """Программный клик кнопки Ок на текущем диалоге. Фоллбек на Enter."""
+        if WIN32_AVAILABLE and hwnd:
+            ok = self._find_ok_button(hwnd)
+            if ok:
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+                try:
+                    win32gui.SendMessage(ok["hwnd"], win32con.BM_CLICK, 0, 0)
+                    return
+                except Exception:
+                    pass
+        self._press("enter")
+
+    def _start_work(self) -> None:
+        """Помечаем что мы внутри работы — обнуляем коробки в работе и стартуем таймер."""
+        self._in_work = True
+        self.boxes_in_work = 0
+        self._work_start_ts = time.time()
+        self._cycle_start_ts = self._work_start_ts
+        self._log_thread("⏱ Старт новой работы.")
+        self._update_cycles_label()
+
+    def _on_work_complete(self) -> None:
+        """Вызывается при первом возврате на 'Главное меню'/'Взятие работы'
+        после выполнения работы. Инкрементит счётчик работ, пишет CSV."""
+        if not self._in_work:
+            return
         self.cycles_count += 1
         duration = None
-        if self._cycle_start_ts is not None:
-            duration = time.time() - self._cycle_start_ts
+        if self._work_start_ts is not None:
+            duration = time.time() - self._work_start_ts
             self.cycle_times.append(duration)
-        self._cycle_start_ts = time.time()
+
+        boxes = self.boxes_in_work
+        self._log_thread(
+            f"✔ Работа #{self.cycles_count} завершена: "
+            f"коробок {boxes}, длительность {duration:.1f} с"
+            if duration is not None
+            else f"✔ Работа #{self.cycles_count} завершена: коробок {boxes}")
+
+        self._in_work = False
+        self.boxes_in_work = 0
+        self._work_start_ts = None
 
         self._update_cycles_label()
         self._update_stats()
@@ -1306,11 +1371,12 @@ class WMSBot(ctk.CTk):
             with open(CYCLES_CSV, "a", encoding="utf-8", newline="") as f:
                 w = csv.writer(f)
                 if is_new:
-                    w.writerow(["timestamp", "duration_sec", "pallet",
-                                "box", "zone", "code"])
+                    w.writerow(["timestamp", "duration_sec", "boxes",
+                                "last_pallet", "last_box", "last_zone", "last_code"])
                 w.writerow([
                     datetime.now().isoformat(timespec="seconds"),
                     f"{duration:.2f}" if duration is not None else "",
+                    boxes,
                     self._current_cycle.get("pallet", ""),
                     self._current_cycle.get("box", ""),
                     self._current_cycle.get("zone", ""),
