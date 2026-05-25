@@ -5,3 +5,4 @@ pygetwindow
 Pillow
 pytesseract
 keyboard
+pywin32

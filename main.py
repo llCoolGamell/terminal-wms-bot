@@ -54,8 +54,17 @@ try:
 except ImportError:
     KEYBOARD_AVAILABLE = False
 
+try:
+    import win32gui
+    import win32con
+    import win32api
+    WIN32_AVAILABLE = True
+except ImportError:
+    WIN32_AVAILABLE = False
+    win32gui = None  # type: ignore
 
-APP_VERSION = "7.0"
+
+APP_VERSION = "7.1"
 APP_DIR = Path(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))))
 # Все рантайм-файлы рядом с exe / скриптом (а не во временной папке PyInstaller)
 RUNTIME_DIR = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) if getattr(sys, "frozen", False) else Path.cwd()
@@ -109,7 +118,18 @@ TESSERACT_CANDIDATES = (
     r"C:\Tesseract-OCR\tesseract.exe",
 )
 
-ERROR_MARKERS = ("не найден", "не существует", "не зарегистрирован", "ошибк")
+ERROR_MARKERS = (
+    "не найден", "не существует", "не зарегистрирован",
+    "ошибк", "не указан", "контрольный разряд",
+    "неверн", "недопустим",
+)
+
+# Размеры окна, которые считаем модальным попапом ошибки/сообщения.
+# (WMS-диалоги обычно крупнее, попап-«сообщение» — мелкое окно с OK.)
+POPUP_MAX_WIDTH = 600
+POPUP_MAX_HEIGHT = 320
+POPUP_MIN_WIDTH = 150
+POPUP_MIN_HEIGHT = 80
 
 # Watchdog: сколько секунд экран должен не меняться, чтобы поставить паузу.
 WATCHDOG_SECONDS = 30.0
@@ -180,6 +200,70 @@ def safe_activate(win) -> bool:
             return True
         except Exception:
             return False
+
+
+# ---------------------- Win32 control enumeration ----------------------
+
+
+def enumerate_child_controls(hwnd: int) -> list[dict]:
+    """Возвращает список дочерних контролов с их классом, текстом и
+    координатами (left, top, right, bottom). Главный инструмент для
+    надёжной работы с WinForms-диалогами без OCR."""
+    if not WIN32_AVAILABLE or hwnd == 0:
+        return []
+    items: list[dict] = []
+
+    def cb(child_hwnd, _):
+        try:
+            cls = win32gui.GetClassName(child_hwnd) or ""
+            if not win32gui.IsWindowVisible(child_hwnd):
+                return True
+            try:
+                rect = win32gui.GetWindowRect(child_hwnd)
+            except Exception:
+                return True
+            text = ""
+            try:
+                text = win32gui.GetWindowText(child_hwnd) or ""
+            except Exception:
+                pass
+            items.append({
+                "hwnd": child_hwnd, "class": cls, "text": text,
+                "rect": rect,
+                "y": rect[1], "x": rect[0],
+                "w": rect[2] - rect[0], "h": rect[3] - rect[1],
+            })
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumChildWindows(hwnd, cb, None)
+    except Exception:
+        return []
+    return items
+
+
+def find_edit_fields(hwnd: int) -> list[dict]:
+    """Только TextBox (Edit) контролы, отсортированы по позиции (сверху-вниз)."""
+    fields = [c for c in enumerate_child_controls(hwnd)
+              if "edit" in c["class"].lower()]
+    fields.sort(key=lambda f: (f["y"], f["x"]))
+    return fields
+
+
+def find_static_texts(hwnd: int) -> list[dict]:
+    """Только Static (Label) контролы. Используется для извлечения зоны."""
+    items = [c for c in enumerate_child_controls(hwnd)
+             if "static" in c["class"].lower() and c["text"]]
+    items.sort(key=lambda f: (f["y"], f["x"]))
+    return items
+
+
+def find_button_controls(hwnd: int) -> list[dict]:
+    """Кнопки диалога."""
+    return [c for c in enumerate_child_controls(hwnd)
+            if "button" in c["class"].lower()]
 
 
 # ---------------------- UI элементы ----------------------
@@ -469,9 +553,16 @@ class WMSBot(ctk.CTk):
     # ---------- UI events ----------
 
     def _on_ocr_toggle(self) -> None:
-        if self.var_ocr.get() and (not PYTESSERACT_AVAILABLE or not self.tesseract_path):
-            self._log("⚠ OCR не доступен — Tesseract или pytesseract отсутствуют. "
-                      "Бот продолжит через буфер обмена.")
+        # При включении галки повторно ищем Tesseract — вдруг юзер только что установил.
+        if self.var_ocr.get():
+            self.tesseract_path = find_tesseract()
+            if self.tesseract_path and PYTESSERACT_AVAILABLE:
+                pytesseract.pytesseract.tesseract_cmd = self.tesseract_path
+                self._log(f"✓ Tesseract найден: {self.tesseract_path}")
+            elif not PYTESSERACT_AVAILABLE:
+                self._log("⚠ Модуль pytesseract отсутствует в exe — OCR недоступен.")
+            else:
+                self._log("⚠ Tesseract.exe не найден. Установи и сними/поставь галку заново.")
         self.lbl_ocr_status.configure(text=self._ocr_status_text())
 
     def _on_loop_change(self, value) -> None:
@@ -758,54 +849,84 @@ class WMSBot(ctk.CTk):
     def _fresh_cycle() -> dict:
         return {"pallet": "", "box": "", "zone": "", "code": "", "error": ""}
 
-    def _extract_value(self, win, field_label: str) -> str:
-        """Достаёт значение поля по подписи. Если OCR — то по тексту,
-        иначе через Tab навигацию и буфер обмена."""
-        # 1) OCR
-        ocr_text = self._ocr_window(win)
-        if ocr_text:
-            patterns = [
-                rf"{field_label}\s*[:.]?\s*([A-ZА-Я0-9\-]+)",
-                rf"{field_label}\s*\n\s*([A-ZА-Я0-9\-]+)",
-            ]
-            for pat in patterns:
-                m = re.search(pat, ocr_text, re.IGNORECASE)
-                if m:
-                    return m.group(1).strip().upper()
-        # 2) Fallback через Tab/буфер: предполагаем что фокус сейчас в Контроль,
-        # Shift+Tab возвращает на предыдущее поле (источник).
-        try:
-            self._is_typing = True
-            pyautogui.hotkey("shift", "tab")
-            time.sleep(self._kbd_delay() * 0.5)
-            pyautogui.hotkey("ctrl", "a")
-            time.sleep(self._kbd_delay() * 0.3)
-            pyautogui.hotkey("ctrl", "c")
-            time.sleep(self._kbd_delay() * 0.5)
-            val = pyperclip.paste().strip()
-            # вернуться на Контроль
-            pyautogui.press("tab")
-            time.sleep(self._kbd_delay() * 0.5)
-            return re.sub(r"\s+", "", val).upper() if val else ""
-        except Exception:
-            return ""
-        finally:
-            self._is_typing = False
+    # ---------- Чтение полей (win32gui → OCR → буфер) ----------
 
-    def _extract_zone(self, win) -> str:
+    def _hwnd_of(self, win) -> int:
+        """Получить hwnd из pygetwindow.Window."""
+        try:
+            return int(getattr(win, "_hWnd", 0))
+        except Exception:
+            return 0
+
+    def _find_source_and_control_edits(self, hwnd: int) -> tuple[Optional[dict], Optional[dict]]:
+        """Возвращает (source_edit, control_edit) для текущего диалога.
+
+        Логика: Контроль — это нижний (или единственный пустой) Edit-контрол.
+        Источник — последний заполненный Edit над ним.
+        """
+        edits = find_edit_fields(hwnd)
+        if not edits:
+            return None, None
+        control = None
+        for e in reversed(edits):
+            if not (e["text"] or "").strip():
+                control = e
+                break
+        if control is None:
+            control = edits[-1]
+        source = None
+        for e in reversed(edits):
+            if e is control:
+                continue
+            if (e["text"] or "").strip():
+                source = e
+                break
+        return source, control
+
+    def _read_source_value(self, win, label_hint: str = "") -> str:
+        """Достаёт значение source-поля. Приоритет: win32gui → OCR → буфер."""
+        hwnd = self._hwnd_of(win)
+        # 1) win32gui — самое надёжное
+        if WIN32_AVAILABLE and hwnd:
+            source, _ = self._find_source_and_control_edits(hwnd)
+            if source and source["text"].strip():
+                return re.sub(r"\s+", "", source["text"]).upper()
+        # 2) OCR по подписи
+        if label_hint:
+            ocr_text = self._ocr_window(win)
+            if ocr_text:
+                for pat in (
+                    rf"{label_hint}\s*[:.]?\s*([A-Za-zА-Яа-я0-9\-_/]+)",
+                    rf"{label_hint}\s*\n\s*([A-Za-zА-Яа-я0-9\-_/]+)",
+                ):
+                    m = re.search(pat, ocr_text, re.IGNORECASE)
+                    if m:
+                        return m.group(1).strip().upper()
+        return ""
+
+    def _read_zone_text(self, win) -> str:
+        """Извлекает название зоны со скрина 'Поиск места-приёмника'.
+        Текст обычно в Static-контроле вида 'Зона: Аша Дальняя'."""
+        hwnd = self._hwnd_of(win)
+        candidates: list[str] = []
+        if WIN32_AVAILABLE and hwnd:
+            for st in find_static_texts(hwnd):
+                candidates.append(st["text"])
+        # OCR-добавка
         ocr_text = self._ocr_window(win)
         if ocr_text:
-            patterns = [
-                r"Зона\s*[:.]?\s*([^\n\r]+)",
-                r"Назначение[^:\n]*:\s*Зона[:.]?\s*([^\n\r]+)",
-                r"в\s+Зона[:.]?\s*([^\n\r]+)",
-                r"Дока?\s+([А-Яа-я][^\n\r]+)",
-            ]
-            for pat in patterns:
-                m = re.search(pat, ocr_text)
+            candidates.extend(ocr_text.splitlines())
+        for line in candidates:
+            for pat in (
+                r"Зона\s*[:.]?\s*(.+)",
+                r"в\s+Зон[уы]\s*[:.]?\s*(.+)",
+                r"Док\w*\s+(.+)",
+            ):
+                m = re.search(pat, line)
                 if m:
-                    return m.group(1).strip(" .,;\u00A0").lower()
-        # без OCR — пусто, бот применит UNIVERSAL_CELL
+                    val = m.group(1).strip(" .,;\u00A0:")
+                    if val:
+                        return val.lower()
         return ""
 
     def _resolve_dock_code(self, zone_text: str) -> tuple[str, bool]:
@@ -818,29 +939,94 @@ class WMSBot(ctk.CTk):
                 return code, False
         return UNIVERSAL_CELL, True
 
-    def _fill_control_and_submit(self, value: str) -> None:
-        """Считаем что фокус уже в Контроль (так дизайнят дизайны WinForms-диалоги).
-        Чистим поле и вставляем значение, затем Enter."""
+    def _click_into_control(self, win) -> bool:
+        """Кликает по полю Контроль через win32gui-координаты. True при успехе."""
+        hwnd = self._hwnd_of(win)
+        if WIN32_AVAILABLE and hwnd:
+            _, control = self._find_source_and_control_edits(hwnd)
+            if control:
+                cx = (control["rect"][0] + control["rect"][2]) // 2
+                cy = (control["rect"][1] + control["rect"][3]) // 2
+                self._click(cx, cy)
+                return True
+        return False
+
+    def _fill_control_and_submit(self, win, value: str) -> bool:
+        """Очищает поле Контроль и отправляет значение + Enter.
+        True если поле найдено."""
+        if not self._click_into_control(win):
+            self._log_thread("⚠ Не нашёл поле Контроль (win32) — пропуск итерации.")
+            return False
+        time.sleep(self._kbd_delay() * 0.3)
         self._hotkey("ctrl", "a")
         self._press("backspace")
         self._paste(value)
         self._press("enter")
+        return True
 
-    def _check_error_popup(self, win) -> bool:
-        """Если на экране попап ошибки — закрыть Enter-ом и пометить флаг
-        fallback_active. Возвращает True если был обнаружен попап."""
-        ocr_text = self._ocr_window(win)
-        text = ocr_text.lower() if ocr_text else ""
-        if not text:
-            # без OCR попап не отлавливаем, но и не блокируем
-            return False
-        if any(marker in text for marker in ERROR_MARKERS):
-            self._log_thread(f"⚠ Попап ошибки: '{text[:60].strip()}…' → Enter, фоллбек.")
-            self.errors_count += 1
-            self.fallback_active = True
-            self._update_stats()
-            self._press("enter")
+    # ---------- Попапы / ошибки ----------
+
+    def _is_popup_window(self, w) -> bool:
+        """Эвристика: маленькое окно НЕ из набора WMS-заголовков и НЕ наше."""
+        try:
+            if not w.title or not w.visible:
+                return False
+            if w.title == self.title():
+                return False
+            if detect_wms_title(w.title):
+                return False
+            width = w.width or 0
+            height = w.height or 0
+            if width < POPUP_MIN_WIDTH or height < POPUP_MIN_HEIGHT:
+                return False
+            if width > POPUP_MAX_WIDTH or height > POPUP_MAX_HEIGHT:
+                return False
             return True
+        except Exception:
+            return False
+
+    def _looks_like_error_text(self, text: str) -> bool:
+        if not text:
+            return False
+        low = text.lower()
+        return any(marker in low for marker in ERROR_MARKERS)
+
+    def _dismiss_popup(self) -> bool:
+        """Сканирует все верхнеуровневые окна. Если есть подозрительный
+        попап — активирует и жмёт Enter. Возвращает True при дисмиссе."""
+        try:
+            wins = gw.getAllWindows()
+        except Exception:
+            return False
+        for w in wins:
+            if not self._is_popup_window(w):
+                continue
+            # читаем текст попапа через win32 (Static-метки) для логирования
+            hwnd = int(getattr(w, "_hWnd", 0) or 0)
+            text_blob = w.title or ""
+            if WIN32_AVAILABLE and hwnd:
+                for st in find_static_texts(hwnd):
+                    text_blob += " | " + st["text"]
+            # критерий: либо текст похож на ошибку, либо это явно модальный диалог
+            is_error = self._looks_like_error_text(text_blob)
+            # Если в окне есть кнопка OK — это модалка-сообщение, тоже дисмиссим.
+            has_ok_button = False
+            if WIN32_AVAILABLE and hwnd:
+                for btn in find_button_controls(hwnd):
+                    if btn["text"].strip().lower() in ("ok", "ок", "&ok", "&ок"):
+                        has_ok_button = True
+                        break
+            if is_error or has_ok_button:
+                self._log_thread(
+                    f"⚠ Попап: '{(text_blob or w.title or '<без заголовка>')[:80].strip()}' → Enter")
+                safe_activate(w)
+                time.sleep(self._kbd_delay() * 0.5)
+                self._press("enter")
+                if is_error:
+                    self.errors_count += 1
+                    self.fallback_active = True
+                    self._update_stats()
+                return True
         return False
 
     # ---------- Главный цикл ----------
@@ -856,6 +1042,13 @@ class WMSBot(ctk.CTk):
             # обновляем delays на каждой итерации (юзер мог подтянуть слайдер)
             loop_delay = self._loop_delay()
 
+            # 1) сначала закрываем попапы, если они есть (это важно — иначе
+            # WMS не пропустит ввод в основной диалог)
+            if self._dismiss_popup():
+                time.sleep(0.25)
+                continue
+
+            # 2) ищем WMS-окно
             win, wms_title = self._find_target_window()
             if win is None:
                 self._log_thread("⚠ WMS-окно не найдено. Жду 1с…")
@@ -869,9 +1062,13 @@ class WMSBot(ctk.CTk):
                 continue
             time.sleep(self._kbd_delay() * 0.5)
 
-            # сигнатура экрана для watchdog: title + первые 80 символов содержимого
-            content = self._ocr_window(win) or self._read_via_clipboard()
-            signature = f"{wms_title}|{content[:80].strip()}"
+            # сигнатура экрана для watchdog
+            sig_parts = [wms_title or win.title]
+            hwnd = self._hwnd_of(win)
+            if WIN32_AVAILABLE and hwnd:
+                for e in find_edit_fields(hwnd)[:5]:
+                    sig_parts.append(e["text"][:30])
+            signature = "|".join(sig_parts)
             self._tick_watchdog(signature)
 
             try:
@@ -886,10 +1083,6 @@ class WMSBot(ctk.CTk):
         self._log_thread("Поток бота завершён.")
 
     def _dispatch_screen(self, win, title: str) -> None:
-        # 0) попап ошибки — приоритет
-        if self._check_error_popup(win):
-            return
-
         if "Главное меню" in title:
             self._log_thread("📺 Главное меню → F2 (Запросить работу)")
             if self._cycle_start_ts is None:
@@ -908,35 +1101,35 @@ class WMSBot(ctk.CTk):
             return
 
         if "Перемещение к источнику" in title:
-            val = self._extract_value(win, "Место")
+            val = self._read_source_value(win, "Место")
             if not val:
-                self._log_thread("⚠ Не получилось извлечь Место — Enter без значения.")
-                self._press("enter")
+                self._log_thread("⚠ Не вижу значение поля Место — жду.")
+                time.sleep(0.5)
                 return
             self._log_thread(f"📺 Перемещение → Место={val}")
-            self._fill_control_and_submit(val)
+            self._fill_control_and_submit(win, val)
             return
 
         if "Поиск паллеты" in title:
-            val = self._extract_value(win, "Паллета")
+            val = self._read_source_value(win, "Паллета")
             if not val:
-                self._log_thread("⚠ Не получилось извлечь Паллета — Enter.")
-                self._press("enter")
+                self._log_thread("⚠ Не вижу значение Паллета — жду.")
+                time.sleep(0.5)
                 return
             self._current_cycle["pallet"] = val
             self._log_thread(f"📺 Паллета → {val}")
-            self._fill_control_and_submit(val)
+            self._fill_control_and_submit(win, val)
             return
 
         if "Поиск коробки" in title:
-            val = self._extract_value(win, "Коробка")
+            val = self._read_source_value(win, "Коробка")
             if not val:
-                self._log_thread("⚠ Не получилось извлечь Коробка — Enter.")
-                self._press("enter")
+                self._log_thread("⚠ Не вижу значение Коробка — жду.")
+                time.sleep(0.5)
                 return
             self._current_cycle["box"] = val
             self._log_thread(f"📺 Коробка → {val}")
-            self._fill_control_and_submit(val)
+            self._fill_control_and_submit(win, val)
             return
 
         if "Поиск места" in title:  # ловит и "Поиск места-приёмника", и без ё
@@ -945,14 +1138,14 @@ class WMSBot(ctk.CTk):
                 self.fallback_active = False
                 zone_text = "(аварийный фоллбек)"
             else:
-                zone_text = self._extract_zone(win)
+                zone_text = self._read_zone_text(win)
                 code, used_fb = self._resolve_dock_code(zone_text)
             if used_fb:
                 self.fallbacks_count += 1
             self._current_cycle["zone"] = zone_text
             self._current_cycle["code"] = code
             self._log_thread(f"📺 Место-приёмник → Зона='{zone_text}' → {code}")
-            self._fill_control_and_submit(code)
+            self._fill_control_and_submit(win, code)
             self._update_stats()
             return
 
@@ -962,9 +1155,9 @@ class WMSBot(ctk.CTk):
             self._on_cycle_complete()
             return
 
-        # неопознанный экран — на всякий случай Enter
-        self._log_thread(f"❓ Неопознанный экран '{title}' → Enter")
-        self._press("enter")
+        # неопознанный экран — НЕ нажимаем Enter (могли попасть в попап с OK),
+        # лучше дать _dismiss_popup отработать на следующей итерации
+        self._log_thread(f"❓ Неопознанный экран '{title}' — пропуск.")
 
     def _on_cycle_complete(self) -> None:
         self.cycles_count += 1
