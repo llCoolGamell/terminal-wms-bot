@@ -64,7 +64,7 @@ except ImportError:
     win32gui = None  # type: ignore
 
 
-APP_VERSION = "7.1"
+APP_VERSION = "7.2"
 APP_DIR = Path(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))))
 # Все рантайм-файлы рядом с exe / скриптом (а не во временной папке PyInstaller)
 RUNTIME_DIR = Path(os.path.dirname(os.path.abspath(sys.argv[0]))) if getattr(sys, "frozen", False) else Path.cwd()
@@ -72,6 +72,7 @@ DOCKS_JSON = RUNTIME_DIR / "wms_docks.json"
 CYCLES_CSV = RUNTIME_DIR / "wms_cycles.csv"
 LAST_SCREEN_PNG = RUNTIME_DIR / "last_screen.png"
 LAST_OCR_TXT = RUNTIME_DIR / "last_ocr.txt"
+TESSERACT_OVERRIDE_TXT = RUNTIME_DIR / "tesseract_path.txt"
 
 DEFAULT_DOCK_MAPPING = {
     "аша дальняя": "D-A-DL-4-2",
@@ -112,11 +113,22 @@ WMS_TITLES = (
 )
 
 # Стандартные пути к Tesseract (Windows).
-TESSERACT_CANDIDATES = (
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-    r"C:\Tesseract-OCR\tesseract.exe",
-)
+def _tesseract_candidates() -> tuple:
+    cands = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        r"C:\Tesseract-OCR\tesseract.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Tesseract-OCR\tesseract.exe"),
+        os.path.expandvars(r"%APPDATA%\Tesseract-OCR\tesseract.exe"),
+        os.path.expandvars(r"%USERPROFILE%\Tesseract-OCR\tesseract.exe"),
+        os.path.expandvars(r"%USERPROFILE%\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"),
+    ]
+    return tuple(c for c in cands if c)
+
+
+TESSERACT_CANDIDATES = _tesseract_candidates()
+TESSERACT_OVERRIDE_FILE = None  # будет заполнен ниже после RUNTIME_DIR
 
 ERROR_MARKERS = (
     "не найден", "не существует", "не зарегистрирован",
@@ -143,12 +155,31 @@ pyautogui.FAILSAFE = True
 
 
 def find_tesseract() -> Optional[str]:
+    # 1) Override-файл рядом с exe (юзер выбрал вручную)
+    try:
+        if TESSERACT_OVERRIDE_TXT.exists():
+            override = TESSERACT_OVERRIDE_TXT.read_text(encoding="utf-8").strip()
+            if override and os.path.isfile(override):
+                return override
+    except Exception:
+        pass
+    # 2) Переменная окружения
     env = os.environ.get("TESSERACT_CMD")
     if env and os.path.isfile(env):
         return env
+    # 3) Известные пути
     for cand in TESSERACT_CANDIDATES:
-        if os.path.isfile(cand):
+        if cand and os.path.isfile(cand):
             return cand
+    # 4) shutil.which — посмотрим в PATH
+    try:
+        import shutil
+        for name in ("tesseract", "tesseract.exe"):
+            found = shutil.which(name)
+            if found and os.path.isfile(found):
+                return found
+    except Exception:
+        pass
     return None
 
 
@@ -449,6 +480,8 @@ class WMSBot(ctk.CTk):
         self.chk_ocr.pack(side="left", padx=10)
         ctk.CTkButton(ocr_row, text="📋 Доки", width=100,
                       command=self._open_dock_editor).pack(side="right", padx=10)
+        ctk.CTkButton(ocr_row, text="📁 Указать Tesseract...", width=180,
+                      command=self._browse_tesseract).pack(side="right", padx=4)
 
         self.lbl_ocr_status = ctk.CTkLabel(self, text=self._ocr_status_text(),
                                            font=("Arial", 11, "italic"),
@@ -562,7 +595,35 @@ class WMSBot(ctk.CTk):
             elif not PYTESSERACT_AVAILABLE:
                 self._log("⚠ Модуль pytesseract отсутствует в exe — OCR недоступен.")
             else:
-                self._log("⚠ Tesseract.exe не найден. Установи и сними/поставь галку заново.")
+                self._log("⚠ Tesseract.exe не найден. Нажми '📁 Указать Tesseract...' "
+                          "чтобы выбрать вручную, или установи с github.com/UB-Mannheim/tesseract.")
+        self.lbl_ocr_status.configure(text=self._ocr_status_text())
+
+    def _browse_tesseract(self) -> None:
+        """Ручной выбор пути к tesseract.exe."""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Выбери tesseract.exe",
+            filetypes=[("Tesseract executable", "tesseract.exe"),
+                       ("Executable", "*.exe"),
+                       ("Все файлы", "*.*")],
+        )
+        if not path:
+            return
+        if not os.path.isfile(path):
+            self._log(f"⚠ Файл не найден: {path}")
+            return
+        try:
+            TESSERACT_OVERRIDE_TXT.write_text(path, encoding="utf-8")
+        except Exception as e:
+            self._log(f"⚠ Не удалось сохранить путь: {e}")
+            return
+        self.tesseract_path = path
+        if PYTESSERACT_AVAILABLE:
+            pytesseract.pytesseract.tesseract_cmd = path
+        self._log(f"✓ Tesseract вручную указан: {path}")
+        # Включаем галку автоматически
+        self.var_ocr.set(True)
         self.lbl_ocr_status.configure(text=self._ocr_status_text())
 
     def _on_loop_change(self, value) -> None:
@@ -939,51 +1000,77 @@ class WMSBot(ctk.CTk):
                 return code, False
         return UNIVERSAL_CELL, True
 
-    def _click_into_control(self, win) -> bool:
-        """Кликает по полю Контроль через win32gui-координаты. True при успехе."""
-        hwnd = self._hwnd_of(win)
-        if WIN32_AVAILABLE and hwnd:
-            _, control = self._find_source_and_control_edits(hwnd)
-            if control:
-                cx = (control["rect"][0] + control["rect"][2]) // 2
-                cy = (control["rect"][1] + control["rect"][3]) // 2
-                self._click(cx, cy)
-                return True
-        return False
-
     def _fill_control_and_submit(self, win, value: str) -> bool:
-        """Очищает поле Контроль и отправляет значение + Enter.
-        True если поле найдено."""
-        if not self._click_into_control(win):
-            self._log_thread("⚠ Не нашёл поле Контроль (win32) — пропуск итерации.")
+        """Записывает значение в поле Контроль и нажимает кнопку Ок —
+        ВСЁ через win32 SendMessage, без эмуляции клавиатуры. Это работает
+        независимо от того, где фокус и есть ли другие окна сверху."""
+        hwnd = self._hwnd_of(win)
+        if not (WIN32_AVAILABLE and hwnd):
+            self._log_thread("⚠ win32gui недоступен — не могу записать значение.")
             return False
+        _, control = self._find_source_and_control_edits(hwnd)
+        if not control:
+            self._log_thread("⚠ Не нашёл поле Контроль (win32) — пропуск.")
+            return False
+
+        # 1) Принудительно даём фокус WMS-окну (обходим случаи когда модалка
+        # перехватила его — её мы должны были закрыть до этого).
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
+        # 2) Прямая запись в Edit
+        try:
+            win32gui.SendMessage(control["hwnd"], win32con.WM_SETTEXT, 0, str(value))
+        except Exception as e:
+            self._log_thread(f"⚠ WM_SETTEXT failed: {e}")
+            # фоллбек на клавиатурный ввод
+            cx = (control["rect"][0] + control["rect"][2]) // 2
+            cy = (control["rect"][1] + control["rect"][3]) // 2
+            self._click(cx, cy)
+            time.sleep(self._kbd_delay() * 0.3)
+            self._hotkey("ctrl", "a")
+            self._press("backspace")
+            self._paste(value)
+            self._press("enter")
+            return True
+
         time.sleep(self._kbd_delay() * 0.3)
-        self._hotkey("ctrl", "a")
-        self._press("backspace")
-        self._paste(value)
+
+        # 3) Программный клик кнопки Ок (если есть) → иначе Enter
+        ok_btn = self._find_ok_button(hwnd)
+        if ok_btn is not None:
+            try:
+                win32gui.SendMessage(ok_btn["hwnd"], win32con.BM_CLICK, 0, 0)
+                return True
+            except Exception as e:
+                self._log_thread(f"⚠ BM_CLICK failed: {e}, фоллбек на Enter.")
+
+        # фоллбек: клик в Контроль (для фокуса) + Enter
+        cx = (control["rect"][0] + control["rect"][2]) // 2
+        cy = (control["rect"][1] + control["rect"][3]) // 2
+        self._click(cx, cy)
+        time.sleep(self._kbd_delay() * 0.3)
         self._press("enter")
         return True
 
-    # ---------- Попапы / ошибки ----------
+    @staticmethod
+    def _find_ok_button(hwnd: int) -> Optional[dict]:
+        btns = find_button_controls(hwnd)
+        # Сортируем по позиции (сверху-вниз, лева-направо) — Ок обычно первая.
+        btns.sort(key=lambda b: (b["y"], b["x"]))
+        for btn in btns:
+            raw = (btn["text"] or "").strip().lower().replace("&", "")
+            # Латиница и кириллица для "ok"/"ок" — обе допустимы
+            if raw in ("ok", "\u043e\u043a", "okay", "\u043e\u043aey"):
+                return btn
+            # Подстрока — на случай "Ок (Enter)" и т.п.
+            if raw and (raw.startswith("ok") or raw.startswith("\u043e\u043a")):
+                return btn
+        return btns[0] if btns else None
 
-    def _is_popup_window(self, w) -> bool:
-        """Эвристика: маленькое окно НЕ из набора WMS-заголовков и НЕ наше."""
-        try:
-            if not w.title or not w.visible:
-                return False
-            if w.title == self.title():
-                return False
-            if detect_wms_title(w.title):
-                return False
-            width = w.width or 0
-            height = w.height or 0
-            if width < POPUP_MIN_WIDTH or height < POPUP_MIN_HEIGHT:
-                return False
-            if width > POPUP_MAX_WIDTH or height > POPUP_MAX_HEIGHT:
-                return False
-            return True
-        except Exception:
-            return False
+    # ---------- Попапы / ошибки ----------
 
     def _looks_like_error_text(self, text: str) -> bool:
         if not text:
@@ -991,42 +1078,85 @@ class WMSBot(ctk.CTk):
         low = text.lower()
         return any(marker in low for marker in ERROR_MARKERS)
 
-    def _dismiss_popup(self) -> bool:
-        """Сканирует все верхнеуровневые окна. Если есть подозрительный
-        попап — активирует и жмёт Enter. Возвращает True при дисмиссе."""
+    @staticmethod
+    def _enumerate_top_windows() -> list[dict]:
+        """Все верхнеуровневые окна через win32 EnumWindows. Использует
+        этот метод вместо pygetwindow, т.к. pygetwindow ИГНОРИРУЕТ окна
+        с пустым заголовком — а модальные попапы WMS как раз такие."""
+        if not WIN32_AVAILABLE:
+            return []
+        items: list[dict] = []
+
+        def cb(hwnd, _):
+            try:
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                title = win32gui.GetWindowText(hwnd) or ""
+                cls = win32gui.GetClassName(hwnd) or ""
+                rect = win32gui.GetWindowRect(hwnd)
+                items.append({
+                    "hwnd": hwnd, "title": title, "class": cls,
+                    "rect": rect,
+                    "w": rect[2] - rect[0], "h": rect[3] - rect[1],
+                })
+            except Exception:
+                pass
+            return True
+
         try:
-            wins = gw.getAllWindows()
+            win32gui.EnumWindows(cb, None)
         except Exception:
+            pass
+        return items
+
+    def _dismiss_popup(self) -> bool:
+        """Через win32 EnumWindows ищет любое верхнеуровневое окно
+        НЕ-WMS и НЕ-наше с кнопкой Ок и небольшим размером — закрывает.
+
+        В отличие от прошлой версии — не фильтрует по непустому заголовку,
+        т.к. WinForms-попап "Не указан код" имеет пустой заголовок."""
+        if not WIN32_AVAILABLE:
             return False
-        for w in wins:
-            if not self._is_popup_window(w):
+        my_hwnd = 0
+        try:
+            my_hwnd = int(self.winfo_id())
+        except Exception:
+            pass
+        for w in self._enumerate_top_windows():
+            hwnd = w["hwnd"]
+            if hwnd == my_hwnd:
                 continue
-            # читаем текст попапа через win32 (Static-метки) для логирования
-            hwnd = int(getattr(w, "_hWnd", 0) or 0)
-            text_blob = w.title or ""
-            if WIN32_AVAILABLE and hwnd:
-                for st in find_static_texts(hwnd):
-                    text_blob += " | " + st["text"]
-            # критерий: либо текст похож на ошибку, либо это явно модальный диалог
-            is_error = self._looks_like_error_text(text_blob)
-            # Если в окне есть кнопка OK — это модалка-сообщение, тоже дисмиссим.
-            has_ok_button = False
-            if WIN32_AVAILABLE and hwnd:
-                for btn in find_button_controls(hwnd):
-                    if btn["text"].strip().lower() in ("ok", "ок", "&ok", "&ок"):
-                        has_ok_button = True
-                        break
-            if is_error or has_ok_button:
-                self._log_thread(
-                    f"⚠ Попап: '{(text_blob or w.title or '<без заголовка>')[:80].strip()}' → Enter")
-                safe_activate(w)
-                time.sleep(self._kbd_delay() * 0.5)
+            if detect_wms_title(w["title"]):
+                continue
+            # Принимаем только окна разумного "попапного" размера
+            if w["w"] < POPUP_MIN_WIDTH or w["w"] > POPUP_MAX_WIDTH:
+                continue
+            if w["h"] < POPUP_MIN_HEIGHT or w["h"] > POPUP_MAX_HEIGHT:
+                continue
+            # Должно иметь кнопку Ок (главный маркер модалки-сообщения)
+            ok_btn = self._find_ok_button(hwnd)
+            if ok_btn is None:
+                continue
+            # Текст попапа из Static-меток для лога
+            body = " | ".join(s["text"] for s in find_static_texts(hwnd) if s["text"])
+            display = body or w["title"] or "<без заголовка>"
+            is_error = self._looks_like_error_text(body) or self._looks_like_error_text(w["title"])
+            self._log_thread(f"⚠ Попап: '{display[:80].strip()}' → клик Ок")
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+            time.sleep(self._kbd_delay() * 0.2)
+            # Программный клик Ок (BM_CLICK работает независимо от фокуса)
+            try:
+                win32gui.SendMessage(ok_btn["hwnd"], win32con.BM_CLICK, 0, 0)
+            except Exception:
                 self._press("enter")
-                if is_error:
-                    self.errors_count += 1
-                    self.fallback_active = True
-                    self._update_stats()
-                return True
+            if is_error:
+                self.errors_count += 1
+                self.fallback_active = True
+                self._update_stats()
+            return True
         return False
 
     # ---------- Главный цикл ----------
